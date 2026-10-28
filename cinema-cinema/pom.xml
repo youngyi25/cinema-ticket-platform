@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.xinghe</groupId>
+        <artifactId>cinema-parent</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>cinema-cinema</artifactId>
+    <name>cinema-cinema</name>
+    <description>影院、影厅、座位基础数据</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.xinghe</groupId>
+            <artifactId>cinema-common</artifactId>
+        </dependency>
+    </dependencies>
+</project>

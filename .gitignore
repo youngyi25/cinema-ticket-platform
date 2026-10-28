@@ -1,0 +1,34 @@
+# ---- build ----
+target/
+build/
+*.jar
+*.war
+!.mvn/wrapper/maven-wrapper.jar
+*.log
+
+# ---- IDE ----
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.project
+.classpath
+*.swp
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- local runtime ----
+*.log.*
+logs/
+run.log
+build.log
+/data/
+*.mv.db
+*.trace.db
+
+# ---- agent workspace (本地笔记，不入库) ----
+.workbuddy/
