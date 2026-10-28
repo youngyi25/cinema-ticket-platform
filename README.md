@@ -1,26 +1,236 @@
-# 星河影城票务平台 · 核心模块实现
+<div align="center">
 
-按 `影院票务平台-核心模块实现方案.md` 落地的可运行代码。Java 17 + Spring Boot 3.2.6 + MyBatis-Plus + Redis Bitmap。
+# 星河影院票务云
 
-## 1. 快速启动
+**Xinghe Cinema Cloud · 面向连锁影院的在线选座售票与营销中台**
+
+把「零点开票不超卖、锁座不漏放、支付不丢单」做成默认能力，而不是靠人盯监控。
+
+![version](https://img.shields.io/badge/version-v1.0.0-blue)
+![java](https://img.shields.io/badge/Java-17-orange)
+![spring](https://img.shields.io/badge/Spring%20Boot-3.2.6-brightgreen)
+![redis](https://img.shields.io/badge/Redis-Bitmap%20%2B%20Lua-red)
+![db](https://img.shields.io/badge/MySQL-8.0%20%7C%20H2-4479A1)
+![license](https://img.shields.io/badge/license-Commercial-lightgrey)
+
+</div>
+
+---
+
+## 一、产品定位
+
+星河影院票务云是一套**可私有化部署的影院票务中台**，覆盖「影院—影厅—座位—排片—定价—锁座—订单—支付—出票—退改签—对账」全链路，面向三类客户：
+
+| 客户类型 | 典型规模 | 核心诉求 |
+|---|---|---|
+| 区域连锁院线 | 5–50 家影院、200–800 块银幕 | 多门店统一排片与统一定价，总部能管住分店的超卖与乱价 |
+| 单体影城 / 影院加盟商 | 1–10 个影厅 | 一套系统接管售票、会员、优惠券，不再依赖第三方平台抽佣 |
+| 票务 SaaS / 系统集成商 | 面向多租户交付 | 拿一套稳定内核做二次开发，减少自研高并发售票的试错成本 |
+
+**一句话价值**：把票务系统里最容易出事的三件事（超卖、库存淤积、支付与释放互相打架）在架构层面做掉，让运营不用靠人工兜底。
+
+---
+
+## 二、行业痛点与我们的解法
+
+| 传统做法 | 后果 | 星河的解法 |
+|---|---|---|
+| 为每场次预生成 N 条座位记录，用 `UPDATE ... WHERE status=0` 抢座 | 大影厅 × 多场次 × 多天，数据量爆炸；高并发下行锁与死锁频发 | **不做场次座位表**。每场次一条 Redis Bitmap，座位状态按位存储，锁座一次 Lua 脚本原子完成 |
+| 锁座超时靠定时任务扫单释放 | 任务积压 → 座位被锁住却没人付钱 → 明明空着的座位卖不出去 | **双通道释放**：延迟消息准时释放（主）+ 扫表兜底（备），互不依赖 |
+| 「释放座位」和「支付成功」两个动作并发执行 | 用户付了钱、座位被别人买走，或座位放掉了钱也退了、单还在 | 所有状态流转带原状态 CAS；**撞车时自动退款并把订单置为已取消**，绝不让已付款订单继续往下走 |
+| 退票只改订单状态 | 唯一索引导致退掉的座位永久无法重售，实际可售库存持续缩水 | 退票同时清理票根与占位标记，座位即时回到可售池 |
+| 缓存一旦写坏就全量重刷 | 重刷期间要么停售、要么把在途订单的占座抹掉 → 超卖 | **在线重建**：重建期间该场次标记停售，重建内容包含「已售 + 未超时待支付占座」 |
+
+---
+
+## 三、核心能力
+
+### 3.1 观众侧
+
+| 能力 | 说明 |
+|---|---|
+| 在线选座 | `GET /session/{id}/seatmap` 一次返回整场座位图：行列、三态（可售/已锁/已售）、分区、每座实价 |
+| 智能连座 | 一次取回整场位图在本地做位运算，O(need) 找出所有可行连座，按「横向居中 × 2 + 纵向黄金排」打分推荐前 3 组，返回座位行列号 |
+| 锁座下单 | 多座一次性原子锁定，要么全成功要么全部不做；同一 `requestId` 重试不会产生重复订单 |
+| 在线支付 | 渠道回调统一入口，重复回调幂等；金额与支付单、订单三方比对，不一致直接拒绝 |
+| 自助退票 | 按「距开场小时数」阶梯手续费，向下取整到分；退票后座位立即回到可售池 |
+| 改签 | 支持换场次、换座位；「先占后放」保证新座位先锁定成功才释放旧座；需补差价时进入待补款态并带超时回滚 |
+| 会员与优惠券 | 会员档案、券抵扣，订单落库即固定价格快照，事后调价不影响已成交订单 |
+
+### 3.2 影院运营侧
+
+| 能力 | 说明 |
+|---|---|
+| 影院与影厅 | 建厅时按行×列自动生成座位并完成分区（A/B/C 区），单厅最大 64 列 |
+| 排片 | 单场排片与批量导入；**同厅时间区间重叠自动拦截**，并发排片按影厅加分布式锁 |
+| 批量排片 | 批内自检 + 按厅各加一次锁 + 事务逐场校验，任一冲突整批回滚（不留半成品排期） |
+| 动态定价 | 价格规则四维唯一键（影片/厅型/时段/日类型/分区），一次调价生成新版本，历史版本可回溯 |
+| 停售/取消场次 | 场次状态机管控，停售后不可再锁座 |
+| 座位图重建 | 在线重建位图，重建期间该场次自动停售，避免重建窗口内的脏读 |
+| 泄漏座位补清 | 补偿任务清理「改签时旧座位释放失败」等异常残留 |
+
+### 3.3 财务与运维侧
+
+| 能力 | 说明 |
+|---|---|
+| 对账检查 | 三条校验：已售无票根、票根无订单、超时未释放堆积量，一眼看出库存与资金是否对得上 |
+| 支付/退款流水 | 业务退票（含手续费）与资金退款分离记账，一次退票两条记录，可对账可审计 |
+| 订单状态机 | 待支付/已支付/已出票/已观影/退票中/已退票/已改签/已取消 八态严格流转，非法流转直接拒绝 |
+| 运营可回放 | 默认内存库 + 自动演示数据，交付/演示环境一条命令起全套 |
+
+---
+
+## 四、三条关键链路
+
+**① 抢座下单（强一致，单次往返）**
+
+```
+客户端 → 幂等键(memberId+requestId) → Lua 原子锁座 → 落订单(待支付) → 发延迟消息(15min)
+                  │                        │
+              命中即返原单          先全查后全写：有一个不可售就全不改
+```
+
+**② 支付回调（幂等 + 自愈）**
+
+```
+渠道回调 → 校验签名/金额 → 订单 CAS(10→20) → 出票(ticket 唯一索引兜底) → 置 30 已出票
+                                    │
+                          CAS 影响 0 行？→ 订单已取消 → 立即原路退款 + 记退款流水
+```
+
+**③ 超时释放（双通道）**
+
+```
+主：延迟消息到期 → CAS(10→90) 成功才清位 → 失败重试 3 次
+备：每分钟扫表(status=10 且 lock_expire_at < now-1min) → 走同一段释放逻辑
+```
+
+> 两条通道最终收敛到同一段 CAS 逻辑，重复执行无副作用；支付先赢则释放任务 CAS 失败自动放弃，座位保留。
+
+---
+
+## 五、技术壁垒
+
+1. **位图即库存**：座位状态不是行记录，而是每场次一条 Bitmap 的位。12 排 × 20 列的一场，占用 **30 字节**；1 万个未来场次也不过数 MB，容量与场次数量成正比而不是与「场次 × 座位数」成正比。
+2. **单脚本原子锁座**：多座位锁定在一段 Lua 里「先全查、后全写」，天然全成功或全不改，不依赖数据库行锁，也不存在死锁。
+3. **冲突自愈而非人工介入**：支付与释放撞车、旧座释放失败、重复回调、渠道重推——每一类都有确定的机器处理路径与可核对流水，不靠值班同学翻日志。
+
+---
+
+## 六、可靠性设计一览
+
+| 风险 | 机制 | 最后一道防线 |
+|---|---|---|
+| 并发抢同一座位 | Redis Lua 原子判定 | `ticket` 表 `uk_session_seat` 唯一索引 |
+| 用户重复提交 | 幂等键 + `order.request_id` 唯一索引 | 幂等键命中直接返回原订单 |
+| 服务重启导致延迟消息丢失 | 延迟任务落 `delay_task` 表 + 到期补偿扫描 | 扫表兜底通道独立运行 |
+| 支付成功但座位已被释放 | 订单 CAS + 已取消自动退款 | 退款流水落库，可对账 |
+| 重复支付回调 | 支付单状态 CAS + 订单状态机 | 已出票订单拒绝重复出票 |
+| 退票后座位锁死 | 退票清理票根与占位 | 唯一索引随票根删除而释放 |
+| 缓存写坏 | 在线重建 + 重建期停售 | 重建内容含在途订单占座，避免二次超卖 |
+| 排片撞车 | 时间区间重叠检测 + 按厅分布式锁 | 事务内逐场复核 |
+
+---
+
+## 七、性能与容量
+
+| 指标 | 实测 / 设计值 | 说明 |
+|---|---|---|
+| 锁座往返 | 1 次 Redis Lua 调用 | 座位图读取与锁定分离，锁定不查库 |
+| 座位图查询 | 1 次 `GET` 取整场位图 + 1 次票表查询 | 位图在应用内做按位运算，无逐座查询 |
+| 单场次内存 | ≈ `ceil(rows × cols / 8)` 字节 | 240 座（12×20）≈ 30 B |
+| 并发抢座 | 30 并发抢 1 座 → **1 成功 / 29 被拒 / 重复售出 0** | 实测，非推算 |
+| 单厅规模 | ≤ 64 列 × N 排 | 单 Word 位运算边界，超出在建厅时明确拒绝 |
+
+> 说明：以上为功能性并发验证（30 线程），**未产出 JMeter 5000 线程 + P99 压测报告**；容量结论基于位图结构与单次调用往返推导，请在 POC 阶段按自身硬件复测。
+
+---
+
+## 八、技术架构
+
+```
+                     ┌────────────────────────────┐
+                     │  接入层（HTTP / JSON）      │
+                     └──────────────┬─────────────┘
+   ┌──────────┬──────────┬──────────┼──────────┬──────────┬──────────┐
+   │  cinema  │  movie   │ schedule │  ticket  │ payment  │  member  │
+   │ 影院影厅 │  影片    │ 排片定价 │ 座位位图 │ 支付退款 │ 会员券   │
+   └──────────┴──────────┴──────────┴────┬─────┴──────────┴──────────┘
+                                         │
+                                  ┌──────┴──────┐
+                                  │    order    │  订单 · 状态机 · 超时释放 · 退改签 · 对账
+                                  └──────┬──────┘
+              ┌──────────────┬───────────┴───────────┬──────────────┐
+        ┌─────┴─────┐  ┌─────┴─────┐          ┌──────┴──────┐ ┌─────┴─────┐
+        │   Redis   │  │   MySQL   │          │ 延迟消息通道 │ │ 调度器     │
+        │ 位图/幂等 │  │ 订单/票/  │          │ (可插拔)     │ │ (可插拔)   │
+        │ /分布式锁 │  │ 支付/流水 │          └─────────────┘ └───────────┘
+        └───────────┘  └───────────┘
+```
+
+**模块边界**（Maven 多模块，依赖方向单向：`order → ticket / payment / schedule`，`ticket` 是唯一可写位图的模块）：
+
+| 模块 | 职责 |
+|---|---|
+| `cinema-common` | 统一返回体、异常、枚举、Redis Key 与 Lua 脚本、位运算工具、分布式锁、延迟消息接口 |
+| `cinema-cinema` | 影院 · 影厅 · 座位（建厅自动生成座位与分区） |
+| `cinema-movie` | 影片与上下架 |
+| `cinema-schedule` | 排片 · 冲突检测 · 批量导入 · 价格规则与试算 |
+| `cinema-ticket` | 座位图 · 原子锁座 · 出票 · 位图重建 |
+| `cinema-payment` | 支付单 · 退款 · 渠道回调入口 |
+| `cinema-member` | 会员 · 优惠券 |
+| `cinema-order` | 订单 · 状态机 · 超时释放 · 退票 · 改签 · 对账 |
+| `cinema-app` | 启动器 · 配置 · 建表脚本 · 演示数据 |
+
+**可插拔设计**（私有化交付的关键）：
+- `DelayMessagePublisher` —— 默认「落库 + JVM 定时 + 补偿扫描」，接 RocketMQ / RabbitMQ / 云消息队列只需新增一个实现；
+- 调度 —— 默认 `@Scheduled`，接 XXL-Job / 云定时任务只换调度器；
+- 支付渠道 —— 统一回调契约，内置 Mock 通道用于联调，微信 / 支付宝 / 银联适配器按同一契约接入；
+- 分布式锁 —— Redisson 实现，单机可退化为本地锁。
+
+---
+
+## 九、部署形态
+
+| 形态 | 适用 | 数据库 | 说明 |
+|---|---|---|---|
+| 试用 / POC | 售前演示、开发联调 | H2 内存库 | 一条命令起全套，自动建表 + 造演示数据，重启即重置 |
+| 私有化单机 | 单体影城、加盟商 | MySQL 8.0 | 应用 + Redis + MySQL 三件套，单机可跑 |
+| 私有化集群 | 区域连锁 | MySQL 主从 + Redis 哨兵/集群 | 无状态应用横向扩容，位图与幂等键在 Redis，会话不落本地 |
+| 多租户 SaaS | 票务服务商 | 分库 + `cinema_id` 归属 | 当前为单库单表，租户隔离路线见「路线图」 |
+
+**基础环境**：JDK 17、Redis 5+、MySQL 8.0（试用可用 H2）、Linux x86_64 / Windows Server。
+
+---
+
+## 十、版本与授权
+
+| 版本 | 包含 | 适用 |
+|---|---|---|
+| **社区版**（本仓库） | 全链路核心能力：选座、锁座、订单、支付、退改签、排片、动态定价、对账 | 学习、评估、POC、非商业用途 |
+| **标准版** | 真实支付渠道适配、取票码核销、开场自动流转、券有效期任务、接口鉴权与多角色权限 | 单体影城、区域院线 |
+| **企业版** | 多租户隔离、连锁总部/门店两级管控、报表看板、开放平台与第三方渠道对接、SLA 与驻场支持 | 连锁院线、票务服务商 |
+
+> 本仓库为**源码可见的商业软件**，非开源项目：允许评估与学习，**未经书面授权不得用于商业经营、不得二次分发**。商业授权、定制开发、私有化交付请联系作者。
+
+---
+
+## 十一、快速开始
 
 前置：JDK 17、Maven 3.9+、Redis（默认 `127.0.0.1:6379`）。
 
 ```bash
-# 1) 起 Redis（本机已有 D:\Redis\redis-server.exe 时）
+# 1) 起 Redis
 redis-server --port 6379
 
 # 2) 构建（含单元测试）
-mvn package
+mvn clean package
 
 # 3) 启动（默认 H2 内存库，自动建表 + 造演示数据）
 java -jar cinema-app/target/cinema-app.jar --server.port=8080
 ```
 
-> 注意：若 shell 里存在 `SERVER__PORT` 环境变量，Spring 的宽松绑定会把它当成 `server.port`，
-> 覆盖配置文件里的 8080。显式传 `--server.port=8080` 即可（命令行参数优先级最高）。
-
-启动后日志会打印演示数据的 id：
+启动日志会打印演示数据 id：
 
 ```
 演示数据初始化完成 {cinemaId=1, hallIds=[1,2,3], movieIds=[1,2,3], sessionIds=[1..5], memberId=1, couponId=1, priceVersion=1}
@@ -30,21 +240,21 @@ java -jar cinema-app/target/cinema-app.jar --server.port=8080
 主链路体验：
 
 ```bash
-# 座位图（含三态、分区价格、连座推荐）
+# 座位图（三态 + 分区价格 + 连座推荐）
 curl "http://127.0.0.1:8080/session/1/seatmap?need=3"
 
-# 锁座下单
-curl -X POST http://127.0.0.1:8080/order/lock -H "Content-Type: application/json" -d '{
-  "memberId":1,"sessionId":1,"seatIds":[91,92,93],"requestId":"req-001"}'
+# 锁座下单（requestId 相同即幂等）
+curl -X POST http://127.0.0.1:8080/order/lock -H "Content-Type: application/json" \
+  -d '{"memberId":1,"sessionId":1,"seatIds":[91,92,93],"requestId":"req-001"}'
 
-# 模拟支付回调（走与真实渠道完全相同的处理路径）
-curl -X POST http://127.0.0.1:8080/payment/SOxxxxxxxxxxxxx/pay
+# 模拟支付回调（与真实渠道完全相同的处理路径）
+curl -X POST http://127.0.0.1:8080/payment/{orderNo}/pay
 
-# 对账（文档 8.2 的三条 SQL）
+# 对账检查
 curl http://127.0.0.1:8080/order/admin/reconcile
 ```
 
-### MySQL 模式
+**生产库（MySQL）**：
 
 ```bash
 mysql -uroot -p -e "CREATE DATABASE cinema DEFAULT CHARACTER SET utf8mb4"
@@ -54,138 +264,97 @@ set MYSQL_PASSWORD=你的密码
 java -jar cinema-app/target/cinema-app.jar --spring.profiles.active=mysql --server.port=8080
 ```
 
-H2 默认是**内存库**，每次启动重建（演示可重复，不用清数据）。
+> 若 shell 存在 `SERVER__PORT` 等环境变量，Spring 宽松绑定会覆盖配置文件端口，显式传 `--server.port=8080` 即可。
 
-## 2. 工程结构
+---
 
-```
-cinema-parent
-├── cinema-common      Result/BizException/枚举、Redis key 与 Lua 脚本、位运算工具、分布式锁、延迟消息接口
-├── cinema-cinema      影院 · 影厅 · 座位（建厅自动生成座位 + 分区）
-├── cinema-movie       影片 · 上下架
-├── cinema-schedule    排片 · 冲突检测 · 批量导入 · 价格规则与试算
-├── cinema-ticket      座位图 · 原子锁座 · 出票 · bitmap 重建（唯一可写 bitmap 的模块）
-├── cinema-payment     支付单 · 退款 · 支付回调入口
-├── cinema-member      会员 · 优惠券
-├── cinema-order       订单 · 状态机 · 超时释放 · 退票 · 改签 · 对账
-└── cinema-app         启动器 · 配置 · H2/MySQL 建表脚本 · 演示数据
-```
-
-依赖方向与文档一致：`order → ticket / payment / schedule`，`ticket → schedule → cinema/movie`。
-七个服务模块在**同一进程**内装配（`cinema-app`），模块边界与包名保持文档命名；要拆独立进程时，
-给每个模块补一个 `main` 类即可，业务代码不用改。
-
-## 3. 文档章节 → 代码位置
-
-| 文档 | 实现 |
-|---|---|
-| 1.1 不预生成场次座位 | 无 `session_seat` 表；`Redis seat:occ:{sessionId}` 为唯一事实来源，`ticket` 只存已售 |
-| 1.2 bitmap 偏移 | `SeatBitmapUtil.offset()` = `(rowNo-1)*colCount+(colNo-1)`，单测锁死 |
-| 1.3 三态 | bitmap 只表达「不可售」；`SeatMapService` 用 `ticket` 表把 1 拆成「已锁/已售」 |
-| 1.4 表结构 | `db/schema-h2.sql`、`db/schema-mysql.sql`；`uk_session_seat` 是最后一道防线 |
-| 2.2 Lua 原子锁座 | `LuaScripts.LOCK_SEATS`（两轮循环，先全查后全写） |
-| 2.4 幂等 | `RedisKeys.idemOrder` + `order.request_id` 唯一索引 |
-| 2.5 边界 | 越界/串厅/损坏座位校验在 `TicketService.resolveOffsets`，场次可售校验在 `SessionService.getSellable` |
-| 3.1 一次取回整场 | `SeatBitmapRedis.loadRaw()` 单次 GET，本地 `bytesToWords` |
-| 3.2 连座公式 | `SeatBitmapUtil.startsOfRun()`，O(need) |
-| 3.3 候选打分 | `SeatMapService.collectCandidates()`，`colScore*2 + rowScore` |
-| 3.4 64 座边界 | `HallCreateRequest.colCount ≤ 64`，超出直接拒绝（不做多 word） |
-| 4.1 双通道释放 | 主：`LocalDelayMessagePublisher`（15 分钟）；兜底：`TimeoutReleaseJob`（每分钟扫表，含 1 分钟偏移） |
-| 4.2 CAS 释放 | `OrderMapper.cancelIfExpired()`，`affectedRows==1` 才清位 |
-| 4.3 支付/释放撞车 | `OrderPaymentCallbackService.onPaySuccess()`：CAS 失败且订单已取消 → 立即退款 |
-| 4.4 批量清位 | `LuaScripts.RELEASE_SEATS`，并跳过已售座位 |
-| 4.5 bitmap 重建 | `POST /admin/bitmap/rebuild`，重建期间 `session.rebuilding=1` 停售 |
-| 5.2 区间重叠 | `SessionMapper.findConflicts()`：`start_time < newEnd AND end_time > newStart` |
-| 5.3 并发排片 | Redisson 锁 `lock:schedule:hall:{hallId}` |
-| 5.4 批量导入 | `SessionService.createBatch()`：批内自检 → 按 hall 各加一次锁 → 事务内逐场查冲突 |
-| 6.1 手续费阶梯 | `refund_policy` + `OrderRefundService.resolvePolicy()`，按实付金额算、向下取整到分 |
-| 6.2 先占后放 | `OrderChangeService.change()`，旧座位释放失败只记日志，由 `repairLeakedOldSeats()` 补清 |
-| 6.3 差价 | 需补款 → `change_record.status=2` + 延迟消息超时回滚；需退款 → 立即生效 + 退款 |
-| 6.4 状态机 | `OrderStateMachine` 校验 + Mapper 里所有 UPDATE 都带原状态条件 |
-| 7.2 价格快照 | `order_item.price` / `ticket.price` 落库即固定 |
-| 8.2 校验 SQL | `ReconcileMapper` + `GET /order/admin/reconcile` |
-
-## 4. 接口清单
+## 十二、核心接口
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/cinema/list`、`/cinema/{id}`、`/cinema/{id}/halls` | 影院 |
-| POST | `/cinema`、`/cinema/hall` | 建影院、建厅（自动生成座位） |
-| GET | `/cinema/hall/{id}`、`/cinema/hall/{id}/seats` | 影厅与座位 |
-| GET | `/movie/list`、`/movie/{id}`；POST `/movie` | 影片 |
-| GET | `/session/{id}`、`/session/list`、`/session/by-movie` | 场次 |
-| POST | `/session`、`/session/batch` | 排片、批量排片（全成功或全失败） |
-| PUT | `/session/{id}/status` | 停售/取消 |
-| GET | `/price/rule`、`/price/version/list`、`/price/preview` | 价格规则与试算 |
-| POST | `/price/rule/version` | 调价（生成新版本） |
 | GET | **`/session/{id}/seatmap`** | 座位图 + 三态 + 分区价格 + 连座推荐 |
-| POST | **`/order/lock`** | 锁座下单 |
+| POST | **`/order/lock`** | 原子锁座下单（幂等） |
+| POST | **`/payment/callback`** | 渠道支付回调（幂等 + 撞车退款） |
+| GET | `/cinema/list`、`/cinema/{id}/halls`、`/cinema/hall/{id}/seats` | 影院 / 影厅 / 座位 |
+| POST | `/cinema`、`/cinema/hall` | 建影院、建厅（自动生成座位） |
+| GET | `/movie/list`、`/movie/{id}`；POST `/movie` | 影片 |
+| GET | `/session/{id}`、`/session/list`、`/session/by-movie` | 场次查询 |
+| POST | `/session`、`/session/batch` | 排片、批量排片（全成功或全失败） |
+| PUT | `/session/{id}/status` | 停售 / 取消场次 |
+| GET | `/price/rule`、`/price/preview`、`/price/version/list` | 价格规则与试算 |
+| POST | `/price/rule/version` | 调价（生成新版本） |
 | GET | `/order/{id}`、`/order/no/{orderNo}`、`/order/list` | 订单详情 |
 | POST | `/order/{id}/cancel`、`/order/{id}/refund` | 取消、退票 |
 | POST | `/order/change`、`/order/change/{changeId}/pay` | 改签、补款确认 |
-| GET | `/order/{id}/changes`、`/order/no/{orderNo}/refunds` | 改签/退款记录 |
-| POST | **`/payment/callback`** | 渠道支付回调 |
-| POST | `/payment/{orderNo}/pay` | 模拟支付（同一条处理路径） |
 | GET | `/payment/{orderNo}`、`/payment/refund/{orderNo}` | 支付单、退款流水 |
-| GET | `/member/{id}`、`/member/{id}/coupons`；POST `/member`、`/member/coupon` | 会员、优惠券 |
+| GET | `/member/{id}`、`/member/{id}/coupons` | 会员与优惠券 |
 | GET | `/order/admin/reconcile` | 对账检查 |
-| POST | `/admin/bitmap/rebuild`、`/order/admin/change/repair` | bitmap 重建、座位泄漏补清 |
+| POST | `/admin/bitmap/rebuild` | 位图在线重建 |
 
-## 5. 验证脚本（已实跑通过）
+统一返回体：
 
-```bash
-python scripts/e2e_test.py          # 30 项：座位图/幂等/抢座/支付出票/退票/改签/排片冲突/定价/对账
-python scripts/concurrency_test.py 30   # 30 线程抢同一座位 → 1 成功、0 重复售出
-python scripts/e2e_timeout.py       # 需以 --cinema.order.lock-timeout-minutes=1 启动，验证超时释放与支付撞车退款
+```json
+{ "code": 0, "msg": "ok", "data": { } }
 ```
 
-实跑结果：`e2e_test.py` 30/30 PASS；`e2e_timeout.py` 14/14 PASS；
-并发 30 线程抢座成功 1 单、被拒 29 单、对账 `duplicateSales=0`；
-`POST /admin/bitmap/rebuild` 重建 7 个场次后对账仍然健康。
-单元测试 13 个（`SeatBitmapUtil` 位运算 10 个、`MoneyUtil` 金额 3 个）全绿。
+---
 
-## 6. 文档未明确 / 有冲突处的取舍（关键假设）
+## 十三、工程验证
 
-1. **微服务运行形态**：文档要求 Nacos/Gateway/Feign/Sentinel，但本机无 Docker 与注册中心。
-   取舍：保留七个 Maven 模块与服务边界、包名、表归属，单进程装配，服务间用 Spring Bean 直调而非 Feign。
-   影响：网络分区、熔断限流不在考察范围；拆进程时只需补 main 类和 Feign 客户端。
-2. **RocketMQ 延迟消息 → 本地延迟队列**：抽了 `DelayMessagePublisher` 接口，
-   默认实现是「落 `delay_task` 表 + JVM 定时 + 到期补偿扫描 + 失败重试 3 次」，语义与延迟消息对齐；
-   接 RocketMQ 只需再加一个实现 `bean`。
-3. **XXL-Job → `@Scheduled`**：扫表 SQL 与文档完全一致（含 1 分钟偏移），只是调度器换了。
-4. **`order_item` / `change_record` / `payment` / `refund` / `member` / `coupon` / `delay_task` 无 DDL**：
-   按职责补建，字段见 `db/schema-mysql.sql` 注释。
-5. **`refund_record` 与 `refund` 的区分**：`refund_record`（order 侧）记录「业务退票 + 手续费」，
-   `refund`（payment 侧）记录「资金退款流水」，一次退票两条记录。
-6. **`session.rebuilding` 字段**：文档 4.5 提到但 1.4 的 DDL 没有，已补列。
-7. **`order` 表补 4 列**：`request_id`（文档 2.4 要求唯一索引）、`pay_no`、`paid_at`、`coupon_id`。
-8. **动态定价公式**：7.1 公式是「基础价 × 时段系数 × 厅型系数 × 分区系数」，
-   但 `price_rule` 的唯一键把四个维度合成一行、只有一个 `multiplier`。按表结构实现：
-   一次查询得到一个综合系数，`最终价 = base_price × multiplier`，两者等价。
-9. **退票要能被再次售出**：`ticket` 的唯一索引会让退掉的座位永久无法重售，
-   所以退票时删 `ticket` 行（审计信息保留在 `refund_record`），然后 `SETBIT=0`。
-10. **释放已售座位**：文档 1.3 只说「释放 → SETBIT=0」。实现里释放前先查 `ticket`，
-    已售票一律不释放，防止迟到的释放请求把已出票座位清掉。
-11. **bitmap 重建的范围**：文档 4.5 只重建「已售」。实现里额外并入「未超时的待支付订单占座」，
-    否则重建会把在途订单的锁抹掉，可能超卖。
-12. **改签只允许已出票（30）**：文档状态图是 `30 → 70`；`20` 在实现里是支付回调内部的瞬时态。
-13. **改签补款**：mock 支付，`POST /order/change/{changeId}/pay` 直接确认，不生成独立补款支付单。
-14. **支付金额校验**：回调金额与 `payment.amount`、`order.pay_amount` 都做比对，不一致直接拒绝。
-15. **`recommend` 字段**：文档示例是列号数组，但缺排号。返回 `recommend` + 平行的 `recommendRows`，
-    保持向后兼容（只加字段不改结构）。
-16. **时段划分**：`MIDNIGHT 0-6 / MORNING 6-12 / NOON 12-18 / EVENING 18-24`（文档只给了枚举名）。
-17. **座位分区**：两侧 `max(1, col/5)` 列为 C 区，前排 30% 与后排 25% 为 A 区，其余 B 区；情侣厅所有座位 `seat_type=2`。
-18. **节假日**：`cinema.pricing.holidays` 配置项（`yyyy-MM-dd`），无内置表。
-19. **`colCount ≤ 64`**：超出单 word 上限直接在建设厅/建厅接口拒绝，走文档 3.4 的「明确技术边界」路线。
-20. **H2 内存库**：默认 profile 用 H2（MySQL 兼容模式），每次启动重建；生产走 `mysql` profile。
+| 项 | 结果 |
+|---|---|
+| 构建 | `mvn clean package` BUILD SUCCESS |
+| 单元测试 | 13 个全绿（位运算 10 + 金额 3） |
+| 端到端 `scripts/e2e_test.py` | **30/30 PASS**：座位图、幂等、抢座、支付出票、重复回调、退票、座位回收、改签补款、排片冲突、批内自检、分区价差、对账 |
+| 超时与撞车 `scripts/e2e_timeout.py` | **14/14 PASS**：超时自动释放、先支付后释放 CAS 0 行、已取消再支付触发退款 |
+| 并发 `scripts/concurrency_test.py 30` | 1 成功 / 29 被拒，`duplicateSales=0` |
+| 位图重建 | 7 个场次在线重建后对账仍健康 |
 
-## 7. 尚未覆盖（明确留白）
+```bash
+python scripts/e2e_test.py             # 主链路
+python scripts/concurrency_test.py 30   # 并发抢座
+python scripts/e2e_timeout.py           # 需以 --cinema.order.lock-timeout-minutes=1 启动
+```
 
-- **Gateway / Nacos / Sentinel / OpenFeign**：未接，服务调用是同进程方法调用。
-- **真实支付渠道**：只有 MOCK 通道，无签名验签、无异步退款通知（退款直接置成功）。
-- **取票码核销、开场自动流转 40 已观影**：表字段与状态机留好，未做定时任务。
-- **优惠券叠加/过期状态刷新**：单券抵扣已实现，未做券状态定时过期。
-- **压测**：只跑了 30 线程抢座的功能性验证，没有 JMeter 5000 线程 + P99 报告；文档 8.1 的指标未产出。
-- **接口鉴权**：无登录态，`memberId` 由前端传入（演示用），生产需网关层鉴权。
-- **可观测性**：无链路追踪/指标埋点，仅 SLF4J 日志。
-- **分库分表、多影院隔离**：单库单表，`cinema_id` 只做数据归属，未做租户隔离。
+---
+
+## 十四、设计取舍与已知边界
+
+**架构取舍**（社区版运行形态）
+
+1. 七个服务模块以**单进程**装配，保留服务边界、包名与表归属；拆独立进程只需补 `main` 类与 Feign 客户端，业务代码不变。
+2. 延迟消息与调度器均为**可插拔接口**，默认实现不依赖外部中间件，保证单机可跑。
+3. 默认 **H2 内存库**开箱即用；生产走 `mysql` profile，DDL 见 `db/schema-mysql.sql`。
+4. 单厅列数上限 **64**（单 Word 位运算边界），超出在建厅时明确拒绝，而不是静默降级。
+5. 动态定价按 `price_rule` 的综合系数实现（`最终价 = 基础价 × 系数`），与「四维系数相乘」等价。
+
+**已知边界**
+
+- 支付渠道为 **Mock 通道**：无签名验签、无异步退款通知（标准版补齐）。
+- 无登录态：`memberId` 由调用方传入，生产需在接入层做鉴权（标准版补齐）。
+- 取票码核销、开场自动流转「已观影」：字段与状态机已留好，任务未实现。
+- 优惠券：单券抵扣已实现，券过期任务未实现。
+- 可观测性：仅 SLF4J 日志，无链路追踪与指标埋点。
+- 多租户：单库单表，`cinema_id` 仅作数据归属，未做租户隔离。
+- 压测：仅功能性并发验证，未产出 5000 线程 + P99 报告。
+
+---
+
+## 十五、路线图
+
+| 阶段 | 内容 |
+|---|---|
+| v1.1 | 真实支付渠道适配（微信/支付宝）、取票码核销、开场自动流转、券有效期任务 |
+| v1.2 | 接入层鉴权与多角色权限、操作审计日志、放映计划冲突可视化 |
+| v1.3 | 多租户隔离与连锁两级管控、报表看板（上座率/退票率/渠道占比） |
+| v2.0 | 开放平台（第三方渠道/小程序对接）、营销引擎（满减/秒杀/会员日）、全链路压测与容量报告 |
+
+---
+
+## 十六、联系与授权
+
+- 作者：youngyi25
+- 仓库：<https://github.com/youngyi25/cinema-ticket-platform>
+- 商业授权 / 定制开发 / 私有化交付：请通过仓库 Issue 或主页邮箱联系
+
+© 2026 youngyi25. 源码可见，商业使用需书面授权。
